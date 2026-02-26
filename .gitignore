@@ -1,0 +1,18 @@
+# Python environments
+.venv/
+__pycache__/
+*.pyc
+
+# Datasets and Images
+synthetic_dataset/
+mlx_dataset/
+unseen_docs/
+unseen_docs_images/
+
+# Model Checkpoints
+vlm_checkpoints/
+adapters.safetensors
+*.safetensors
+
+# OS files
+.DS_Store
