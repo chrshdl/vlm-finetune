@@ -24,15 +24,17 @@ def export_mlx_dataset(
     """
     os.makedirs(image_out_dir, exist_ok=True)
 
+    # system prompt demands the rationale step first
     system_prompt = (
-        "You are an expert logistics data extraction AI."
-        "Extract the information from the provided document image chunks into a strict JSON "
-        f"object that matches the following schema:\n{schema_json}"
+        "You are an expert logistics data extraction AI.\n"
+        "First, analyze the document chunks and extract the required information step-by-step. "
+        "Enclose your reasoning within <rationale> and </rationale> tags. \n"
+        "Then, output the extracted information into a strict JSON object that matches the following schema:\n"
+        f"{schema_json}"
     )
 
     with open(output_jsonl, "w") as f:
         for pdf_path, truth_dict in zip(pdf_paths, ground_truths):
-            # convert all pages of the PDF to a list of PIL Images
             images = convert_from_path(pdf_path, dpi=72)
             page_images = [img.convert("RGB") for img in images]
 
@@ -41,19 +43,14 @@ def export_mlx_dataset(
 
             for page_idx, img in enumerate(page_images):
                 width, height = img.size
-
-                # split the page into 2 horizontal chunks top and bottom
                 num_chunks = 2
                 chunk_height = height // num_chunks
-                overlap = 50  # we add a 50px overlap so the text on the cut-line isn't destroyed
+                overlap = 50
 
                 for chunk_idx in range(num_chunks):
-                    # then we calculate the bounding box (left, top, right, bottom)
                     top = max(0, chunk_idx * chunk_height - overlap)
                     bottom = min(height, (chunk_idx + 1) * chunk_height + overlap)
-
                     chunk_img = img.crop((0, top, width, bottom))
-
                     chunk_path = os.path.join(
                         image_out_dir,
                         f"{base_name}_page{page_idx}_chunk{chunk_idx}.jpg",
@@ -61,10 +58,15 @@ def export_mlx_dataset(
                     chunk_img.save(chunk_path)
                     image_paths.append(chunk_path)
 
-            # create one image dict per generated chunk
             user_content = [{"type": "image"} for _ in image_paths]
             user_content.append(
                 {"type": "text", "text": "Extract the bill of lading details."}
+            )
+
+            # the assistant message includes the rationale and the JSON block
+            assistant_text = (
+                f"<rationale>\n{truth_dict['rationale']}\n</rationale>\n\n"
+                f"```json\n{json.dumps(truth_dict['json_data'], indent=2)}\n```"
             )
 
             messages = [
@@ -75,7 +77,7 @@ def export_mlx_dataset(
                 {"role": "user", "content": user_content},
                 {
                     "role": "assistant",
-                    "content": [{"type": "text", "text": json.dumps(truth_dict)}],
+                    "content": [{"type": "text", "text": assistant_text}],
                 },
             ]
 
@@ -84,12 +86,11 @@ def export_mlx_dataset(
 
 
 def generate_synthetic_dataset(index, output_dir="synthetic_dataset"):
-    """Generates a single synthetic PDF and its ground truth JSON."""
+    """Generates a single synthetic PDF and its ground truth JSON + Rationale."""
     os.makedirs(output_dir, exist_ok=True)
-
     fake = Faker()
 
-    ground_truth = {
+    json_data = {
         "shipper_name": fake.company(),
         "consignee_name": fake.company(),
         "vessel": f"{fake.word().capitalize()} {random.randint(100, 999)}V",
@@ -102,55 +103,83 @@ def generate_synthetic_dataset(index, output_dir="synthetic_dataset"):
         "total_gross_weight_kg": round(random.uniform(5000.0, 25000.0), 2),
     }
 
+    # generate a synthetic rationale acting as the teacher's thought process
+    rationale = (
+        f"Scanning the top of the document, I identify the Shipper as '{json_data['shipper_name']}' "
+        f"and the Consignee as '{json_data['consignee_name']}'. "
+        f"The vessel and voyage number is listed as '{json_data['vessel']}'. "
+        f"The Port of Loading is '{json_data['port_of_loading']}' and the Port of Discharge is "
+        f"'{json_data['port_of_discharge']}'. Moving to the containers section, "
+        f"I count {len(json_data['container_numbers'])} container(s): {', '.join(json_data['container_numbers'])}. "
+        f"Finally, at the bottom, the total gross weight is recorded as {json_data['total_gross_weight_kg']} KG."
+    )
+
+    ground_truth = {"rationale": rationale, "json_data": json_data}
+
     pdf_path = os.path.join(output_dir, f"bol_{index}.pdf")
     c = canvas.Canvas(pdf_path, pagesize=letter)
 
-    # we add a slight layout variance so the model doesn't overfit to exact pixels
     x_offset = random.randint(-20, 20)
     y_offset = random.randint(-20, 20)
 
-    c.setFont("Helvetica-Bold", 16)
+    font_families = [
+        ("Helvetica", "Helvetica-Bold"),
+        ("Times-Roman", "Times-Bold"),
+        ("Courier", "Courier-Bold"),
+    ]
+
+    regular_font, bold_font = random.choice(font_families)
+
+    base_font_size = random.randint(8, 14)
+    header_font_size = base_font_size + 4  # header slightly larger
+    line_spacing = int(base_font_size * 2.5)
+
+    c.setFont(bold_font, header_font_size)
     c.drawString(200 + x_offset, 750 + y_offset, "BILL OF LADING")
 
-    c.setFont("Helvetica", 12)
+    c.setFont(regular_font, base_font_size)
+
+    start_y = 700 + y_offset
+
+    c.drawString(50 + x_offset, start_y, f"Shipper: {json_data['shipper_name']}")
     c.drawString(
-        50 + x_offset, 700 + y_offset, f"Shipper: {ground_truth['shipper_name']}"
-    )
-    c.drawString(
-        50 + x_offset, 670 + y_offset, f"Consignee: {ground_truth['consignee_name']}"
-    )
-    c.drawString(
-        50 + x_offset, 640 + y_offset, f"Vessel/Voyage: {ground_truth['vessel']}"
+        50 + x_offset,
+        start_y - line_spacing,
+        f"Consignee: {json_data['consignee_name']}",
     )
     c.drawString(
         50 + x_offset,
-        610 + y_offset,
-        f"Port of Loading: {ground_truth['port_of_loading']}",
+        start_y - (line_spacing * 2),
+        f"Vessel/Voyage: {json_data['vessel']}",
     )
     c.drawString(
         50 + x_offset,
-        580 + y_offset,
-        f"Port of Discharge: {ground_truth['port_of_discharge']}",
+        start_y - (line_spacing * 3),
+        f"Port of Loading: {json_data['port_of_loading']}",
+    )
+    c.drawString(
+        50 + x_offset,
+        start_y - (line_spacing * 4),
+        f"Port of Discharge: {json_data['port_of_discharge']}",
     )
 
-    c.drawString(50 + x_offset, 530 + y_offset, "Containers:")
-    y_pos = 510 + y_offset
-    for container in ground_truth["container_numbers"]:
+    c.drawString(50 + x_offset, start_y - (line_spacing * 6), "Containers:")
+    y_pos = start_y - (line_spacing * 7)
+    for container in json_data["container_numbers"]:
         c.drawString(70 + x_offset, y_pos, f"- {container}")
-        y_pos -= 20
+        y_pos -= int(base_font_size * 1.5)
 
     c.drawString(
         50 + x_offset,
-        y_pos - 20,
-        f"Total Gross Weight: {ground_truth['total_gross_weight_kg']} KG",
+        y_pos - line_spacing,
+        f"Total Gross Weight: {json_data['total_gross_weight_kg']} KG",
     )
 
-    # 0.5 chance to generate a second page
     if random.choice([True, False]):
         c.showPage()
-        c.setFont("Helvetica-Bold", 14)
+        c.setFont(bold_font, header_font_size)
         c.drawString(50 + x_offset, 750 + y_offset, "Page 2: Terms and Conditions")
-        c.setFont("Helvetica", 10)
+        c.setFont(regular_font, base_font_size - 2)  # T&Cs are usually smaller
         c.drawString(
             50 + x_offset,
             720 + y_offset,
@@ -171,7 +200,9 @@ def generate_synthetic_dataset(index, output_dir="synthetic_dataset"):
     return pdf_path, ground_truth
 
 
-def load_or_generate_synthetic_data(data_dir: str, num_docs: int) -> list[tuple[str, dict]]:
+def load_or_generate_synthetic_data(
+    data_dir: str, num_docs: int
+) -> list[tuple[str, dict]]:
     print("Checking for existing synthetic documents...")
     metadata_file = os.path.join(data_dir, "metadata.json")
     os.makedirs(data_dir, exist_ok=True)
@@ -193,9 +224,7 @@ def load_or_generate_synthetic_data(data_dir: str, num_docs: int) -> list[tuple[
     if not pdf_paths:
         print(f"Generating {num_docs} synthetic documents...")
         for i in range(num_docs):
-            pdf_path, truth = generate_synthetic_dataset(
-                i, output_dir=data_dir
-            )
+            pdf_path, truth = generate_synthetic_dataset(i, output_dir=data_dir)
             pdf_paths.append(pdf_path)
             ground_truths.append(truth)
 
@@ -207,7 +236,9 @@ def load_or_generate_synthetic_data(data_dir: str, num_docs: int) -> list[tuple[
     return list(zip(pdf_paths, ground_truths))
 
 
-def split_dataset(combined_data: list, split_ratio: float, seed: int) -> tuple[list, list]:
+def split_dataset(
+    combined_data: list, split_ratio: float, seed: int
+) -> tuple[list, list]:
     random.seed(seed)
     combined = list(combined_data)
     random.shuffle(combined)
